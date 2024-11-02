@@ -1,7 +1,7 @@
 {
 	"name": "fake-time-series",
 	"description": "A flexible CLI tool and library for generating fake time series data. Perfect for testing, development, and demonstration purposes.",
-	"version": "0.0.0",
+	"version": "1.0.0",
 	"author": "Tim Mikeladze <tim.mikeladze@gmail.com>",
 	"license": "MIT",
 	"keywords": [
