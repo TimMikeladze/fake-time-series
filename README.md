@@ -12,11 +12,11 @@ A flexible CLI tool and library for generating fake time series data. Perfect fo
 ## 📡 Installation
 
 ```bash
-npm install fake-time-series-generator
+npm install fake-time-series
 
-yarn add fake-time-series-generator
+yarn add fake-time-series
 
-pnpm add fake-time-series-generator
+pnpm add fake-time-series
 ```
 
 > 👋 Hello there! Follow me [@linesofcode](https://twitter.com/linesofcode) or visit [linesofcode.dev](https://linesofcode.dev) for more cool projects like this one.
