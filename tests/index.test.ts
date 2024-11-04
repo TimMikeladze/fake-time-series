@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { type FakeTimeSeriesData, generate, toSink } from "../src";
 
 describe("generateTimeSeries", () => {
-	it("should generate time series data with default options", () => {
-		const { batches } = generate();
+	it("should generate time series data with default options", async () => {
+		const { batches } = await generate();
 		const firstBatch = batches[0];
 
 		expect(Array.isArray(firstBatch)).toBe(true);
@@ -17,11 +17,11 @@ describe("generateTimeSeries", () => {
 		expect(firstDataPoint).toHaveProperty("data");
 	});
 
-	it("should respect time bounds", () => {
+	it("should respect time bounds", async () => {
 		const startTime = new Date("2024-01-01");
 		const endTime = new Date("2024-01-02");
 
-		const { batches } = generate({ startTime, endTime });
+		const { batches } = await generate({ startTime, endTime });
 
 		for (const batch of batches) {
 			for (const point of batch) {
@@ -31,13 +31,13 @@ describe("generateTimeSeries", () => {
 		}
 	});
 
-	it("should throw error if start time is after end time", () => {
-		expect(() =>
+	it("should throw error if start time is after end time", async () => {
+		await expect(
 			generate({
 				startTime: "2024-01-02",
 				endTime: "2024-01-01",
 			}),
-		).toThrow("Start time must be before end time");
+		).rejects.toThrow("Start time must be before end time");
 	});
 });
 

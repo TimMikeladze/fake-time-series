@@ -85,9 +85,9 @@ export interface FakeTimeSeriesResult {
 	totalMessages: number;
 }
 
-export function generate(
+export async function* generateBatches(
 	options: FakeTimeSeriesOptions = {},
-): FakeTimeSeriesResult {
+): AsyncGenerator<FakeTimeSeriesData[], void, unknown> {
 	const mergedOptions: Required<FakeTimeSeriesOptions> = {
 		...defaultOptions,
 		...options,
@@ -116,8 +116,6 @@ export function generate(
 
 	const shapeKeys = Object.keys(mergedOptions.shapes);
 	let currentTime = new Date(start.getTime());
-	const allBatches: FakeTimeSeriesData[][] = [];
-	let totalMessages = 0;
 
 	while (currentTime < end) {
 		const batchSize = mergedOptions.batchSizeRandomization
@@ -177,12 +175,38 @@ export function generate(
 				batch.sort(() => Math.random() - 0.5);
 			}
 
-			allBatches.push(batch);
-			totalMessages += batch.length;
+			yield batch;
 		} else {
 			// If we couldn't add any points to the batch, we're stuck
 			break;
 		}
+	}
+}
+
+export async function generate(
+	options: FakeTimeSeriesOptions = {},
+): Promise<FakeTimeSeriesResult> {
+	const mergedOptions = {
+		...defaultOptions,
+		...options,
+	} as Required<FakeTimeSeriesOptions>;
+
+	const start = parseTime(mergedOptions.startTime);
+	const end = parseTime(mergedOptions.endTime);
+	const minInt = parseInterval(mergedOptions.minInterval);
+	const maxInt = parseInterval(mergedOptions.maxInterval);
+
+	const allBatches: FakeTimeSeriesData[][] = [];
+	let totalMessages = 0;
+
+	// Consume the generator synchronously
+	const generator = generateBatches(options);
+	let result = await generator.next();
+	while (!result.done) {
+		const batch = result.value;
+		allBatches.push(batch);
+		totalMessages += batch.length;
+		result = await generator.next();
 	}
 
 	return {
@@ -224,7 +248,7 @@ export async function toSink(
 	const limit = pLimit(mergedOptions.concurrency || 1);
 	const requests = [];
 
-	const { batches, ...other } = generate(mergedOptions);
+	const { batches, ...other } = await generate(mergedOptions);
 	for (const batch of batches) {
 		requests.push(
 			limit(async () => {

@@ -110,7 +110,7 @@ generateCommand
 			...configOptions,
 		};
 
-		const result = generate(parsedOptions);
+		const result = await generate(parsedOptions);
 		console.log(JSON.stringify(result, null, 2));
 	});
 
