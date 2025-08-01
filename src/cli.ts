@@ -6,6 +6,7 @@ import {
 	type FakeTimeSeriesData,
 	type FakeTimeSeriesOptions,
 	type FakeTimeSeriesToSinkOptions,
+	type TransformFunction,
 	generate,
 	toSink,
 } from ".";
@@ -16,6 +17,8 @@ async function loadConfig(configPath?: string): Promise<
 			FakeTimeSeriesToSinkOptions & {
 				headers?: Record<string, string>;
 				sinkUrl?: string;
+				transform?: TransformFunction;
+				concurrency?: number;
 			}
 	>
 > {
@@ -150,8 +153,11 @@ sendCommand
 		};
 
 		const parsedOptions: FakeTimeSeriesToSinkOptions = {
-			...options,
 			...configOptions,
+			...options,
+			concurrency: options.concurrency
+				? Number.parseInt(options.concurrency, 10)
+				: configOptions.concurrency,
 			fetcher,
 			onError:
 				configOptions.onError || ((error) => console.error("Error:", error)),

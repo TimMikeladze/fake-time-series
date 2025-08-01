@@ -48,6 +48,7 @@ export const options = {
   maxInterval: "30s",
   maxBatchSize: 20,
   sinkUrl: "http://localhost:3000/api/ingest",
+  concurrency: 5,
   headers: {
     "Authorization": "Bearer your-token",
     "Content-Type": "application/json"
@@ -79,6 +80,64 @@ export const config = {
 		}),
 	},
 };
+```
+
+### Transform Function
+
+You can add a `transform` function to modify the structure of each generated data point. This is useful when you need to convert the default format to match your target system's expected format.
+
+The transform function receives a data point with the structure:
+```javascript
+{
+  timestamp: number,
+  key: string,
+  data: Record<string, unknown>
+}
+```
+
+And should return a new object with your desired structure.
+
+Example:
+```javascript
+// fake-time-series.config.mjs
+export const options = {
+  shapes: {
+    temperature: () => ({
+      sensorId: Math.random().toString(36).substring(2, 15),
+      value: Math.random() * 100,
+    }),
+  },
+  transform: (dataPoint) => ({
+    partitionKey: dataPoint.key,
+    timestamp: dataPoint.timestamp,
+    data: {
+      value: dataPoint.data.value || "",
+    },
+  }),
+};
+```
+
+This will transform each data point from:
+```javascript
+{
+  timestamp: 1753950933982,
+  key: "temperature",
+  data: {
+    sensorId: "138lnj9gs7kq",
+    value: 12.1311483084942,
+  },
+}
+```
+
+To:
+```javascript
+{
+  partitionKey: "138lnj9gs7kq",
+  timestamp: 1753950933982,
+  data: {
+    value: 12.1311483084942,
+  },
+}
 ```
 
 Specify a custom config path:
@@ -122,6 +181,7 @@ For `minInterval` and `maxInterval`:
 | `batchReverseProbability` | Chance to reverse batch order | `0.5` |
 | `batchShuffleProbability` | Chance to shuffle batch | `0.4` |
 | `intervalSkewProbability` | Chance of interval skewing | `0.8` |
+| `transform` | Function to transform data points | `undefined` |
 | `concurrency` | Max concurrent requests (send only) | `10` |
 | `sinkUrl` | Endpoint URL (send only) | required |
 | `headers` | Request headers (send only) | `{"Content-Type": "application/json"}` |

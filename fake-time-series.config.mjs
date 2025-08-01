@@ -5,4 +5,5 @@ export const options = {
 			value: Math.random() * 100,
 		}),
 	},
+	concurrency: 10,
 };

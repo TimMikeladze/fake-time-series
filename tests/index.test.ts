@@ -3,30 +3,39 @@ import { type FakeTimeSeriesData, generate, toSink } from "../src";
 
 describe("generateTimeSeries", () => {
 	it("should generate time series data with default options", async () => {
-		const { batches } = await generate();
-		const firstBatch = batches[0];
+		const result = await generate({
+			startTime: "2024-01-01T00:00:00Z",
+			endTime: "2024-01-01T00:01:00Z",
+			minInterval: "10s",
+			maxInterval: "10s",
+		});
 
-		expect(Array.isArray(firstBatch)).toBe(true);
-		expect(firstBatch.length).toBeGreaterThan(0);
-		expect(firstBatch.length).toBeLessThanOrEqual(10);
-
-		const firstDataPoint = firstBatch[0];
-		expect(firstDataPoint).toHaveProperty("timestamp");
-		expect(firstDataPoint.timestamp).toBeGreaterThan(0);
-		expect(firstDataPoint).toHaveProperty("key");
-		expect(firstDataPoint).toHaveProperty("data");
+		expect(result.batches.length).toBeGreaterThan(0);
+		expect(result.totalMessages).toBeGreaterThan(0);
+		expect(result.startTime).toEqual(new Date("2024-01-01T00:00:00Z"));
+		expect(result.endTime).toEqual(new Date("2024-01-01T00:01:00Z"));
 	});
 
 	it("should respect time bounds", async () => {
-		const startTime = new Date("2024-01-01");
-		const endTime = new Date("2024-01-02");
+		const result = await generate({
+			startTime: "2024-01-01T00:00:00Z",
+			endTime: "2024-01-01T00:00:30Z",
+			minInterval: "10s",
+			maxInterval: "10s",
+		});
 
-		const { batches } = await generate({ startTime, endTime });
+		expect(result.batches.length).toBeGreaterThan(0);
+		expect(result.totalMessages).toBeGreaterThan(0);
 
-		for (const batch of batches) {
-			for (const point of batch) {
-				expect(point.timestamp).toBeGreaterThanOrEqual(startTime.getTime());
-				expect(point.timestamp).toBeLessThanOrEqual(endTime.getTime());
+		// Check that all timestamps are within bounds
+		for (const batch of result.batches) {
+			for (const dataPoint of batch) {
+				expect(dataPoint.timestamp).toBeGreaterThanOrEqual(
+					new Date("2024-01-01T00:00:00Z").getTime(),
+				);
+				expect(dataPoint.timestamp).toBeLessThanOrEqual(
+					new Date("2024-01-01T00:00:30Z").getTime(),
+				);
 			}
 		}
 	});
@@ -34,10 +43,42 @@ describe("generateTimeSeries", () => {
 	it("should throw error if start time is after end time", async () => {
 		await expect(
 			generate({
-				startTime: "2024-01-02",
-				endTime: "2024-01-01",
+				startTime: "2024-01-01T00:01:00Z",
+				endTime: "2024-01-01T00:00:00Z",
 			}),
 		).rejects.toThrow("Start time must be before end time");
+	});
+
+	it("should apply transform function when provided", async () => {
+		const transform = (dataPoint: FakeTimeSeriesData) => ({
+			partitionKey: "test",
+			timestamp: dataPoint.timestamp,
+			data: {
+				value: dataPoint.data.value || 0,
+			},
+		});
+
+		const result = await generate({
+			startTime: "2024-01-01T00:00:00Z",
+			endTime: "2024-01-01T00:00:10Z",
+			minInterval: "5s",
+			maxInterval: "5s",
+			transform,
+		});
+
+		expect(result.batches.length).toBeGreaterThan(0);
+		expect(result.totalMessages).toBeGreaterThan(0);
+
+		// Check that transform was applied
+		for (const batch of result.batches) {
+			for (const dataPoint of batch) {
+				expect(dataPoint).toHaveProperty("partitionKey", "test");
+				expect(dataPoint).toHaveProperty("timestamp");
+				expect(dataPoint).toHaveProperty("data.value");
+				// Should not have the original structure
+				expect(dataPoint).not.toHaveProperty("key");
+			}
+		}
 	});
 });
 

@@ -7,6 +7,8 @@ export type FakeTimeSeriesData = {
 	data: Record<string, unknown>;
 };
 
+export type TransformFunction = (dataPoint: FakeTimeSeriesData) => unknown;
+
 export type ShapeFunctions = {
 	[key: string]: (currentTime: Date) => Record<string, unknown>;
 };
@@ -55,6 +57,7 @@ export interface FakeTimeSeriesOptions {
 	batchShuffleProbability?: number;
 	intervalSkewProbability?: number;
 	shapes?: ShapeFunctions;
+	transform?: TransformFunction;
 }
 
 export const defaultOptions: FakeTimeSeriesOptions = {
@@ -73,6 +76,7 @@ export const defaultOptions: FakeTimeSeriesOptions = {
 			value: Math.random(),
 		}),
 	},
+	transform: undefined,
 };
 
 export interface FakeTimeSeriesResult {
@@ -164,7 +168,12 @@ export async function* generateBatches(
 				data: mergedOptions.shapes[shapeKey](currentTime),
 			};
 
-			batch.push(dataPoint);
+			// Apply transform function if provided
+			const finalDataPoint = mergedOptions.transform
+				? mergedOptions.transform(dataPoint)
+				: dataPoint;
+
+			batch.push(finalDataPoint as unknown as FakeTimeSeriesData);
 		}
 
 		if (batch.length > 0) {
