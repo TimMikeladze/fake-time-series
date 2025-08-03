@@ -153,8 +153,8 @@ sendCommand
 		};
 
 		const parsedOptions: FakeTimeSeriesToSinkOptions = {
-			...configOptions,
 			...options,
+			...configOptions,
 			concurrency: options.concurrency
 				? Number.parseInt(options.concurrency, 10)
 				: configOptions.concurrency,
@@ -163,8 +163,9 @@ sendCommand
 				configOptions.onError || ((error) => console.error("Error:", error)),
 		};
 
+		console.log("Sending data to sink...");
 		const result = await toSink(parsedOptions);
-		console.log("Data sent to sink successfully:");
+		console.log(JSON.stringify(result, null, 2));
 	});
 
 program.parse(process.argv);
