@@ -5,10 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildProgram } from "../src/cli";
 import {
 	loadConfig,
+	parseDurationMs,
 	parsePositiveInt,
 	parseProbability,
 	readVersion,
 	resolveConfigPath,
+	runLive,
 } from "../src/cli-helpers";
 import type {
 	FakeTimeSeriesOptions,
@@ -238,6 +240,247 @@ describe("parseProbability", () => {
 	it("rejects leading sign", () => {
 		expect(() => parse("+0.5")).toThrow(/--p must be a number between 0 and 1/);
 		expect(() => parse("-0.5")).toThrow(/--p must be a number between 0 and 1/);
+	});
+});
+
+describe("parseDurationMs", () => {
+	const parse = parseDurationMs("--live-interval");
+
+	it("parses a positive millisecond integer", () => {
+		expect(parse("500")).toBe(500);
+	});
+
+	it("parses human-readable seconds via ms()", () => {
+		expect(parse("1s")).toBe(1000);
+	});
+
+	it("parses human-readable milliseconds via ms()", () => {
+		expect(parse("250ms")).toBe(250);
+	});
+
+	it("parses minutes", () => {
+		expect(parse("2m")).toBe(120_000);
+	});
+
+	it("accepts zero as a valid (instant re-tick) interval", () => {
+		// A 0ms live-interval is legal: it means "sleep 0, then immediately
+		// tick again". Rejecting 0 would force users to pick a surprising
+		// floor like 1ms; the tests below that use `--live-interval 0` in
+		// CLI integration rely on this behavior.
+		expect(parse("0")).toBe(0);
+	});
+
+	it("rejects negative millisecond integers", () => {
+		expect(() => parse("-1")).toThrow(/--live-interval/);
+	});
+
+	it("rejects negative human-readable durations", () => {
+		expect(() => parse("-1s")).toThrow(/--live-interval/);
+	});
+
+	it("rejects garbage strings", () => {
+		expect(() => parse("nope")).toThrow(/--live-interval/);
+	});
+
+	it("rejects partial parses", () => {
+		// "1s foo" must not silently parse as 1000 — catches the same class
+		// of bug parsePositiveInt guards against with its regex gate.
+		expect(() => parse("1s foo")).toThrow(/--live-interval/);
+	});
+});
+
+describe("runLive", () => {
+	it("invokes the tick function with advancing windows where each start equals the previous end", async () => {
+		const ticks: Array<{ start: Date; end: Date }> = [];
+		const controller = new AbortController();
+		let clockMs = new Date("2024-01-01T00:00:00Z").getTime();
+
+		await runLive({
+			initialStartTime: new Date("2024-01-01T00:00:00Z"),
+			intervalMs: 100,
+			signal: controller.signal,
+			now: () => new Date(clockMs),
+			sleep: async (ms) => {
+				clockMs += ms;
+			},
+			tick: async (start, end) => {
+				ticks.push({ start, end });
+				// Simulate the tick doing a tiny bit of work so the next
+				// window is guaranteed to be non-empty.
+				clockMs += 5;
+				if (ticks.length >= 3) {
+					controller.abort();
+				}
+			},
+		});
+
+		expect(ticks).toHaveLength(3);
+		// First tick starts exactly at the user-supplied initialStartTime.
+		expect(ticks[0].start.toISOString()).toBe("2024-01-01T00:00:00.000Z");
+		// Every subsequent tick's start equals the previous tick's end —
+		// this is the core contract that makes live mode non-lossy (no gap
+		// between windows) and non-overlapping (no duplicate data).
+		for (let i = 1; i < ticks.length; i++) {
+			expect(ticks[i].start.getTime()).toBe(ticks[i - 1].end.getTime());
+		}
+		// Every window is non-empty.
+		for (const t of ticks) {
+			expect(t.end.getTime()).toBeGreaterThan(t.start.getTime());
+		}
+	});
+
+	it("exits immediately without ticking when signal is already aborted", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		let ticks = 0;
+
+		await runLive({
+			initialStartTime: new Date("2024-01-01T00:00:00Z"),
+			intervalMs: 100,
+			signal: controller.signal,
+			now: () => new Date("2024-01-01T00:00:05Z"),
+			sleep: async () => undefined,
+			tick: async () => {
+				ticks++;
+			},
+		});
+
+		expect(ticks).toBe(0);
+	});
+
+	it("skips tick when the window is empty but keeps sleeping until aborted", async () => {
+		let tickCalls = 0;
+		let sleepCalls = 0;
+		const controller = new AbortController();
+		// Clock never advances — every window would be [now, now] (empty).
+		const frozen = new Date("2024-01-01T00:00:00Z");
+
+		await runLive({
+			initialStartTime: frozen,
+			intervalMs: 1,
+			signal: controller.signal,
+			now: () => frozen,
+			sleep: async () => {
+				sleepCalls++;
+				if (sleepCalls >= 3) {
+					controller.abort();
+				}
+			},
+			tick: async () => {
+				tickCalls++;
+			},
+		});
+
+		// Tick never fired because every window was empty (start == end).
+		// Previously, a naïve implementation would have thrown "Start time
+		// must be before end time" from the library on the very first call.
+		expect(tickCalls).toBe(0);
+		// The loop kept running and sleeping — so it's still alive and
+		// respecting the abort signal, just not producing data.
+		expect(sleepCalls).toBeGreaterThanOrEqual(3);
+	});
+
+	it("propagates errors thrown by the tick function", async () => {
+		const controller = new AbortController();
+		await expect(
+			runLive({
+				initialStartTime: new Date("2024-01-01T00:00:00Z"),
+				intervalMs: 100,
+				signal: controller.signal,
+				now: () => new Date("2024-01-01T00:00:05Z"),
+				sleep: async () => undefined,
+				tick: async () => {
+					throw new Error("tick kaboom");
+				},
+			}),
+		).rejects.toThrow("tick kaboom");
+	});
+
+	it("rejects a negative intervalMs", async () => {
+		const controller = new AbortController();
+		await expect(
+			runLive({
+				initialStartTime: new Date(),
+				intervalMs: -1,
+				signal: controller.signal,
+				tick: async () => undefined,
+			}),
+		).rejects.toThrow(/intervalMs/);
+	});
+
+	it("rejects a non-finite intervalMs", async () => {
+		const controller = new AbortController();
+		await expect(
+			runLive({
+				initialStartTime: new Date(),
+				intervalMs: Number.POSITIVE_INFINITY,
+				signal: controller.signal,
+				tick: async () => undefined,
+			}),
+		).rejects.toThrow(/intervalMs/);
+	});
+
+	it("calls sleep between ticks with the requested intervalMs", async () => {
+		const sleeps: number[] = [];
+		const controller = new AbortController();
+		let clockMs = new Date("2024-01-01T00:00:00Z").getTime();
+		let tickCount = 0;
+
+		await runLive({
+			initialStartTime: new Date("2024-01-01T00:00:00Z"),
+			intervalMs: 250,
+			signal: controller.signal,
+			now: () => new Date(clockMs),
+			sleep: async (ms) => {
+				sleeps.push(ms);
+				clockMs += ms;
+			},
+			tick: async () => {
+				tickCount++;
+				// Nudge the clock forward so the next window is non-empty.
+				clockMs += 1;
+				if (tickCount >= 3) {
+					controller.abort();
+				}
+			},
+		});
+
+		expect(sleeps.length).toBeGreaterThan(0);
+		for (const s of sleeps) {
+			expect(s).toBe(250);
+		}
+	});
+
+	it("does not sleep after a tick if the signal was aborted during that tick", async () => {
+		const sleeps: number[] = [];
+		const controller = new AbortController();
+		const initialStart = new Date("2024-01-01T00:00:00Z");
+		// Clock starts AHEAD of initialStart so the very first window is
+		// non-empty and the tick actually fires on iteration 1. Without
+		// this primer, the loop would skip the tick (empty window) and
+		// sleep forever.
+		let clockMs = initialStart.getTime() + 1000;
+		let tickCount = 0;
+
+		await runLive({
+			initialStartTime: initialStart,
+			intervalMs: 500,
+			signal: controller.signal,
+			now: () => new Date(clockMs),
+			sleep: async (intervalMs) => {
+				sleeps.push(intervalMs);
+			},
+			tick: async () => {
+				tickCount++;
+				clockMs += 10;
+				// Abort *during* the tick — the loop should check the signal
+				// before sleeping and exit without paying the sleep cost.
+				controller.abort();
+			},
+		});
+
+		expect(tickCount).toBe(1);
+		expect(sleeps).toHaveLength(0);
 	});
 });
 
@@ -515,6 +758,189 @@ describe("buildProgram", () => {
 				}
 			}
 		});
+
+		it("loops in live mode, logs once per tick, and exits when aborted", async () => {
+			// End-to-end live mode for `generate`:
+			//   * runner fires once per tick
+			//   * each tick's window chains cleanly from the previous
+			//     (start == previous end)
+			//   * the first window's start equals the user-supplied startTime,
+			//     resolved ONCE up front (not re-evaluated per tick, which
+			//     would drift on relative strings like "-1 day")
+			//   * one log per tick
+			//   * loop exits after the controller aborts (no hang)
+			const generateCalls: FakeTimeSeriesOptions[] = [];
+			const logs: string[] = [];
+			const controller = new AbortController();
+			let clockMs = new Date("2024-01-01T00:00:00Z").getTime();
+
+			const program = buildProgram({
+				generateRunner: async (options) => {
+					generateCalls.push(options);
+					// Nudge the fake clock so the next window is non-empty.
+					clockMs += 1;
+					if (generateCalls.length >= 3) {
+						controller.abort();
+					}
+					return {
+						batches: [],
+						startTime: options.startTime as Date,
+						endTime: options.endTime as Date,
+						minInterval: 1000,
+						maxInterval: 1000,
+						totalBatches: 0,
+						totalMessages: 0,
+					};
+				},
+				log: (msg) => {
+					logs.push(msg);
+				},
+				onError: (err) => {
+					throw err;
+				},
+				liveSignal: controller.signal,
+				now: () => new Date(clockMs),
+				sleep: async (ms) => {
+					clockMs += ms;
+				},
+			});
+			program.exitOverride();
+			for (const cmd of program.commands) {
+				cmd.exitOverride();
+			}
+
+			await program.parseAsync(
+				[
+					"node",
+					"cli",
+					"generate",
+					"--startTime",
+					"2024-01-01T00:00:00Z",
+					"--minInterval",
+					"1s",
+					"--maxInterval",
+					"1s",
+					"--live",
+					"--live-interval",
+					"100",
+				],
+				{ from: "node" },
+			);
+
+			expect(generateCalls).toHaveLength(3);
+			// First tick's start == resolved user startTime.
+			expect((generateCalls[0].startTime as Date).toISOString()).toBe(
+				"2024-01-01T00:00:00.000Z",
+			);
+			// Every tick's start == previous tick's end (no gap/overlap).
+			for (let i = 1; i < generateCalls.length; i++) {
+				expect((generateCalls[i].startTime as Date).getTime()).toBe(
+					(generateCalls[i - 1].endTime as Date).getTime(),
+				);
+			}
+			// Each tick logs its own JSON result.
+			expect(logs).toHaveLength(3);
+			for (const msg of logs) {
+				// Must be valid JSON so live output is still machine-pipeable.
+				expect(() => JSON.parse(msg)).not.toThrow();
+			}
+			// CLI-only live flags must not leak into library options.
+			for (const call of generateCalls) {
+				const raw = call as unknown as Record<string, unknown>;
+				expect(raw.live).toBeUndefined();
+				expect(raw.liveInterval).toBeUndefined();
+				expect(raw.config).toBeUndefined();
+			}
+		});
+
+		it("rejects an invalid --live-interval at parse time", async () => {
+			const controller = new AbortController();
+			const program = buildProgram({
+				onError: (err) => {
+					throw err;
+				},
+				log: () => undefined,
+				liveSignal: controller.signal,
+			});
+			program.exitOverride();
+			for (const cmd of program.commands) {
+				cmd.exitOverride();
+			}
+
+			// Invalid live-interval must fail fast via commander's parser,
+			// BEFORE the action handler runs — no infinite loop, no silent
+			// default fallback.
+			await expect(
+				program.parseAsync(
+					[
+						"node",
+						"cli",
+						"generate",
+						"--live",
+						"--live-interval",
+						"not-a-duration",
+					],
+					{ from: "node" },
+				),
+			).rejects.toThrow(/--live-interval/);
+		});
+
+		it("defaults --live-interval to 1s when the flag is omitted", async () => {
+			// User omits --live-interval; the CLI should still enter live
+			// mode and the sleep helper should be called with the default
+			// 1000ms. Captured via the injected sleep stub.
+			const sleepCalls: number[] = [];
+			const controller = new AbortController();
+			let clockMs = new Date("2024-01-01T00:00:00Z").getTime();
+			let calls = 0;
+
+			const program = buildProgram({
+				generateRunner: async (options) => {
+					calls++;
+					clockMs += 1;
+					if (calls >= 2) controller.abort();
+					return {
+						batches: [],
+						startTime: options.startTime as Date,
+						endTime: options.endTime as Date,
+						minInterval: 1000,
+						maxInterval: 1000,
+						totalBatches: 0,
+						totalMessages: 0,
+					};
+				},
+				log: () => undefined,
+				onError: (err) => {
+					throw err;
+				},
+				liveSignal: controller.signal,
+				now: () => new Date(clockMs),
+				sleep: async (ms) => {
+					sleepCalls.push(ms);
+					clockMs += ms;
+				},
+			});
+			program.exitOverride();
+			for (const cmd of program.commands) {
+				cmd.exitOverride();
+			}
+
+			await program.parseAsync(
+				[
+					"node",
+					"cli",
+					"generate",
+					"--startTime",
+					"2024-01-01T00:00:00Z",
+					"--live",
+				],
+				{ from: "node" },
+			);
+
+			expect(calls).toBeGreaterThanOrEqual(1);
+			// At least one sleep was the default 1000ms.
+			expect(sleepCalls).toContain(1000);
+		});
 	});
 
 	describe("send command", () => {
@@ -700,6 +1126,93 @@ describe("buildProgram", () => {
 			expect(call.concurrency).toBe(11);
 			// Config wins where no CLI flag: maxBatchSize 7 from fixture
 			expect(call.maxBatchSize).toBe(7);
+		});
+
+		it("loops in live mode, chaining windows, until the signal aborts", async () => {
+			// Drive the send command with --live and verify:
+			//   1. toSink is called once per tick
+			//   2. Each tick's startTime == the previous tick's endTime
+			//      (no gap, no overlap)
+			//   3. The loop exits cleanly when the controller aborts
+			//   4. sinkUrl/headers/live/liveInterval are not leaked into
+			//      library options
+			const toSinkCalls: FakeTimeSeriesToSinkOptions[] = [];
+			const controller = new AbortController();
+			let clockMs = new Date("2024-01-01T00:00:00Z").getTime();
+
+			const program = buildProgram({
+				toSinkRunner: async (options) => {
+					toSinkCalls.push(options);
+					// Pretend the tick took 1ms so the next window is non-empty.
+					clockMs += 1;
+					if (toSinkCalls.length >= 2) {
+						controller.abort();
+					}
+					return {
+						batches: [],
+						startTime: options.startTime as Date,
+						endTime: options.endTime as Date,
+						minInterval: 1000,
+						maxInterval: 1000,
+						totalBatches: 0,
+						totalMessages: 0,
+					};
+				},
+				log: () => undefined,
+				onError: (err) => {
+					throw err;
+				},
+				liveSignal: controller.signal,
+				now: () => new Date(clockMs),
+				sleep: async (ms) => {
+					clockMs += ms;
+				},
+			});
+			program.exitOverride();
+			for (const cmd of program.commands) {
+				cmd.exitOverride();
+			}
+
+			await program.parseAsync(
+				[
+					"node",
+					"cli",
+					"send",
+					"--sink-url",
+					"https://example.com/ingest",
+					"--startTime",
+					"2024-01-01T00:00:00Z",
+					"--live",
+					"--live-interval",
+					"50",
+				],
+				{ from: "node" },
+			);
+
+			expect(toSinkCalls).toHaveLength(2);
+			for (const call of toSinkCalls) {
+				expect(typeof call.fetcher).toBe("function");
+				expect(call.startTime).toBeInstanceOf(Date);
+				expect(call.endTime).toBeInstanceOf(Date);
+				// CLI-only fields must not leak into library options.
+				const raw = call as unknown as Record<string, unknown>;
+				expect(raw.sinkUrl).toBeUndefined();
+				expect(raw.headers).toBeUndefined();
+				expect(raw.live).toBeUndefined();
+				expect(raw.liveInterval).toBeUndefined();
+			}
+			// Chained windows: every tick picks up exactly where the
+			// previous one left off.
+			for (let i = 1; i < toSinkCalls.length; i++) {
+				expect((toSinkCalls[i].startTime as Date).getTime()).toBe(
+					(toSinkCalls[i - 1].endTime as Date).getTime(),
+				);
+			}
+			// First tick starts at the user-provided startTime (resolved
+			// once, before the loop).
+			expect((toSinkCalls[0].startTime as Date).toISOString()).toBe(
+				"2024-01-01T00:00:00.000Z",
+			);
 		});
 
 		it("passes injected sinkBatchErrorHandler through to toSink", async () => {

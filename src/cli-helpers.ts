@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
+import { setTimeout as sleepMs } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import type { Command } from "commander";
+import ms from "ms";
 import type {
 	FakeTimeSeriesOptions,
 	FakeTimeSeriesToSinkOptions,
@@ -148,6 +150,178 @@ export const parseProbability =
 		}
 		return parsed;
 	};
+
+// Runtime-safe cast of the `ms()` API. Its public typings restrict the
+// argument to a narrow `StringValue` template literal, but at runtime it
+// happily accepts any string and returns `undefined` for invalid input.
+// We validate the undefined return below, so this boundary cast is the
+// honest, type-safe-at-the-edge choice. Mirrors the pattern used by
+// `parseInterval` in src/index.ts.
+const msParseDuration = ms as unknown as (value: string) => number | undefined;
+
+// Accept raw non-negative millisecond integers. Stricter than
+// POSITIVE_INT_PATTERN because we want to allow "0" here (a 0ms tick
+// interval is a legitimate "re-tick immediately" signal in live mode),
+// which parsePositiveInt rejects.
+const NON_NEGATIVE_INT_PATTERN = /^\d+$/;
+
+/**
+ * Commander parser for a duration flag expressed in milliseconds.
+ * Accepts either a non-negative integer (interpreted as milliseconds)
+ * or a human-readable duration that `ms()` understands
+ * (`"1s"`, `"500ms"`, `"2m"`, …). Returns the duration in milliseconds.
+ *
+ * Rejects: negative values, non-numeric garbage, partial parses
+ * (`"1s foo"`), and non-finite results.
+ *
+ * Used by the `--live-interval` flag in live mode; split out so the
+ * parser can be unit-tested in isolation from commander wiring.
+ */
+export const parseDurationMs =
+	(name: string) =>
+	(value: string): number => {
+		const trimmed = value.trim();
+
+		// Fast path: plain non-negative integer → milliseconds.
+		if (NON_NEGATIVE_INT_PATTERN.test(trimmed)) {
+			const parsed = Number.parseInt(trimmed, 10);
+			if (Number.isFinite(parsed) && parsed >= 0) {
+				return parsed;
+			}
+		}
+
+		// Fall back to `ms()` for human-readable durations. `ms()` returns
+		// `undefined` for garbage and accepts negative values (e.g. "-1s"
+		// → -1000), which we must reject.
+		const parsed = msParseDuration(trimmed);
+		if (parsed === undefined || !Number.isFinite(parsed) || parsed < 0) {
+			throw new Error(
+				`${name} must be a non-negative duration ` +
+					`(e.g. "1s", "500ms", or a millisecond integer; got "${value}")`,
+			);
+		}
+
+		// Defence in depth against `ms()` partial parsing. At the time of
+		// writing, `ms("1s foo")` returns `undefined`, but a future version
+		// bump could silently swap behavior. We double-check by re-parsing
+		// the original input minus known-good characters.
+		if (/\s/.test(trimmed)) {
+			throw new Error(
+				`${name} must be a non-negative duration ` +
+					`(e.g. "1s", "500ms", or a millisecond integer; got "${value}")`,
+			);
+		}
+
+		return parsed;
+	};
+
+/**
+ * Options accepted by {@link runLive}.
+ *
+ * Every hazardous external dependency (clock, sleep, signal) is injectable
+ * so the loop is deterministically testable without waiting on wall-clock
+ * time or spawning child processes. Production wiring plugs in `Date`,
+ * `timers/promises#setTimeout`, and a SIGINT-driven AbortController.
+ */
+export interface RunLiveOptions {
+	/**
+	 * Resolved start time for the first window. Must be an absolute Date —
+	 * callers are responsible for resolving relative strings (e.g. "-1 day")
+	 * exactly once BEFORE the loop begins, so the window doesn't drift.
+	 */
+	initialStartTime: Date;
+	/** Milliseconds to sleep between ticks. Must be finite and >= 0. */
+	intervalMs: number;
+	/** Signal that terminates the loop cleanly when aborted. */
+	signal: AbortSignal;
+	/**
+	 * Called once per tick with the current window `[start, end]`. Errors
+	 * thrown here propagate up and terminate the loop; transient errors
+	 * (e.g. a single failed HTTP request) should be handled inside `tick`.
+	 */
+	tick: (windowStart: Date, windowEnd: Date) => Promise<void>;
+	/** Clock injection for tests. Defaults to `() => new Date()`. */
+	now?: () => Date;
+	/**
+	 * Sleep injection for tests. Defaults to `timers/promises#setTimeout`
+	 * with the abort signal wired in, so a real SIGINT wakes the loop
+	 * immediately instead of waiting out the rest of the interval.
+	 */
+	sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+/**
+ * Default sleep implementation for live mode. Wraps
+ * `timers/promises#setTimeout` and swallows the `AbortError` that fires
+ * when the signal is aborted mid-sleep — a user-initiated SIGINT is
+ * expected behavior, not a failure mode.
+ */
+const defaultLiveSleep = async (
+	intervalMs: number,
+	signal: AbortSignal,
+): Promise<void> => {
+	try {
+		await sleepMs(intervalMs, undefined, { signal });
+	} catch (error: unknown) {
+		// AbortError is the expected path during graceful shutdown. Any
+		// other error is a real bug and must surface.
+		if (error instanceof Error && error.name === "AbortError") {
+			return;
+		}
+		throw error;
+	}
+};
+
+/**
+ * Run a tick function repeatedly in a non-overlapping, non-lossy window
+ * loop until the provided `AbortSignal` fires.
+ *
+ * Window semantics:
+ *   * First window is `[initialStartTime, now()]`.
+ *   * Each subsequent window is `[previousEnd, now()]` — so no data is
+ *     missed (no gap) and no data is double-counted (no overlap).
+ *   * If the window is empty (`now() <= previousEnd`), the tick is
+ *     skipped for this iteration, but the loop still sleeps and
+ *     re-checks on the next iteration.
+ *
+ * Shutdown semantics:
+ *   * `signal.aborted === true` on entry → returns without ticking.
+ *   * Signal fires DURING a tick → the loop checks immediately after
+ *     the tick returns and exits without sleeping.
+ *   * Signal fires DURING the sleep → default sleep unblocks via the
+ *     signal wired into `timers/promises#setTimeout`.
+ *
+ * Errors thrown by `tick` propagate up and terminate the loop. Callers
+ * that want "log and continue" behavior should wrap their tick body in
+ * a try/catch.
+ */
+export async function runLive(opts: RunLiveOptions): Promise<void> {
+	if (!Number.isFinite(opts.intervalMs) || opts.intervalMs < 0) {
+		throw new Error(
+			`intervalMs must be a non-negative finite number (got ${opts.intervalMs})`,
+		);
+	}
+
+	const now = opts.now ?? (() => new Date());
+	const sleep = opts.sleep ?? defaultLiveSleep;
+
+	let windowStart = opts.initialStartTime;
+
+	while (!opts.signal.aborted) {
+		const windowEnd = now();
+		if (windowEnd.getTime() > windowStart.getTime()) {
+			await opts.tick(windowStart, windowEnd);
+			windowStart = windowEnd;
+		}
+		// Re-check BEFORE sleeping so an abort that arrived during the
+		// tick doesn't make us pay an unnecessary full interval before
+		// exiting.
+		if (opts.signal.aborted) {
+			break;
+		}
+		await sleep(opts.intervalMs, opts.signal);
+	}
+}
 
 /**
  * Walk up from the script location to find the nearest `package.json`

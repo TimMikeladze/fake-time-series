@@ -18,7 +18,18 @@ export type ShapeFunctions = {
 type TimeInput = Date | number | string;
 type IntervalInput = string | number;
 
-const parseTime = (time: TimeInput): Date => {
+/**
+ * Parse any supported time input (absolute `Date`, epoch milliseconds,
+ * or a chrono-node-compatible string like `"-1 day"` or
+ * `"2024-01-01T00:00:00Z"`) into a concrete `Date`.
+ *
+ * Exported so the CLI's `--live` mode can resolve the user-supplied
+ * `startTime` exactly ONCE before entering the tick loop. Resolving it
+ * per tick would cause relative strings (`"-1 day"`) to drift forward
+ * every iteration, silently generating the same window's data over and
+ * over instead of continuously streaming fresh data.
+ */
+export const parseTime = (time: TimeInput): Date => {
 	if (time instanceof Date) {
 		return time;
 	}

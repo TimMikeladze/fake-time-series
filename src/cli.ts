@@ -5,9 +5,11 @@ import { Command } from "commander";
 import {
 	collectExplicitOptions,
 	loadConfig,
+	parseDurationMs,
 	parsePositiveInt,
 	parseProbability,
 	readVersion,
+	runLive,
 } from "./cli-helpers";
 import {
 	type FakeTimeSeriesData,
@@ -15,8 +17,26 @@ import {
 	type FakeTimeSeriesResult,
 	type FakeTimeSeriesToSinkOptions,
 	generate,
+	parseTime,
 	toSink,
 } from "./index";
+
+/**
+ * Default tick interval for `--live` mode when the user doesn't pass
+ * `--live-interval`. One second is a friendly middle ground: fast enough
+ * that `fake-time-series generate --live | jq` feels responsive, slow
+ * enough that a default invocation doesn't spin the CPU.
+ */
+const DEFAULT_LIVE_INTERVAL_MS = 1000;
+
+/**
+ * Default library-level startTime when the user doesn't pass a flag and
+ * there's no config value. Mirrors `defaultOptions.startTime` in
+ * `src/index.ts`; we need it explicitly here because `runLive` has to
+ * resolve the initial window start ONCE before entering the loop (see
+ * the extended comment in the action handlers below).
+ */
+const DEFAULT_START_TIME = "-1 day";
 
 /**
  * Options accepted by {@link buildProgram} — lets tests inject stubs for
@@ -45,6 +65,26 @@ export interface BuildProgramOptions {
 	sinkBatchErrorHandler?: (error: unknown) => void;
 	/** Optional stdout sink for action output. Defaults to `console.log`. */
 	log?: (message: string) => void;
+	/**
+	 * Signal that terminates `--live` mode's tick loop. The production
+	 * entry point wires this to `SIGINT` / `SIGTERM`; tests inject their
+	 * own controller so they can deterministically stop the loop after
+	 * a fixed number of ticks. If omitted, a fresh never-aborted signal
+	 * is used — which means `--live` runs forever, so tests that exercise
+	 * live mode MUST provide their own signal.
+	 */
+	liveSignal?: AbortSignal;
+	/**
+	 * Clock injection for `--live` mode. Passed through to {@link runLive}.
+	 * Defaults to `() => new Date()`. Tests use this to drive a fake clock.
+	 */
+	now?: () => Date;
+	/**
+	 * Sleep injection for `--live` mode. Passed through to {@link runLive}.
+	 * Defaults to `timers/promises#setTimeout` wired to the abort signal.
+	 * Tests use this to skip real wall-clock waits.
+	 */
+	sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
 const defaultErrorHandler = (error: unknown): void => {
@@ -103,7 +143,17 @@ const withCommonOptions = (command: Command): Command =>
 			parseProbability("--intervalSkewProbability"),
 			0.8,
 		)
-		.option("-c, --config <path>", "Path to config file");
+		.option("-c, --config <path>", "Path to config file")
+		.option(
+			"--live",
+			"Continuously stream data in a loop (one tick per --live-interval) until the process receives SIGINT/SIGTERM",
+		)
+		.option(
+			"--live-interval <duration>",
+			'Interval between ticks in --live mode (e.g. "1s", "500ms", or raw ms integer)',
+			parseDurationMs("--live-interval"),
+			DEFAULT_LIVE_INTERVAL_MS,
+		);
 
 /**
  * Construct a fresh commander `Command` tree for the `fake-time-series`
@@ -118,6 +168,10 @@ export function buildProgram(opts: BuildProgramOptions = {}): Command {
 	const sinkBatchErrorHandler =
 		opts.sinkBatchErrorHandler ?? defaultSinkBatchErrorHandler;
 	const log = opts.log ?? defaultLog;
+	// If no live signal is provided we create a fresh never-aborted one;
+	// it's only consulted on the `--live` code path, so the default case
+	// (no --live flag) costs exactly one AbortController allocation.
+	const liveSignal = opts.liveSignal ?? new AbortController().signal;
 
 	const program = new Command();
 	program
@@ -136,12 +190,55 @@ export function buildProgram(opts: BuildProgramOptions = {}): Command {
 				const configOptions = await loadConfig(configPath);
 				const cliOptions = collectExplicitOptions(command);
 				delete cliOptions.config;
+				// `--live` and `--live-interval` are CLI-only controls for
+				// the tick loop — they must NOT leak into the library options
+				// spread below, otherwise unknown properties would surface
+				// in `FakeTimeSeriesOptions` and potentially confuse future
+				// config consumers.
+				const liveMode = cliOptions.live === true;
+				delete cliOptions.live;
+				delete cliOptions.liveInterval;
 
 				// CLI-explicit options override config; config overrides library defaults.
 				const parsedOptions: FakeTimeSeriesOptions = {
 					...configOptions,
 					...cliOptions,
 				};
+
+				if (liveMode) {
+					// `getOptionValue` returns the committed value whether it
+					// came from the CLI, the default, or an intermediate
+					// option-source, so we get the default 1000ms fallback
+					// for free when the user omits the flag.
+					const intervalMs = command.getOptionValue("liveInterval") as number;
+					// CRITICAL: resolve `startTime` exactly ONCE up front.
+					// A relative string like "-1 day" must NOT be re-parsed
+					// every tick — that would anchor every window to
+					// "1 day ago (relative to current now)" and trap live
+					// mode in the same window forever.
+					const initialStartTime = parseTime(
+						(parsedOptions.startTime ??
+							configOptions.startTime ??
+							DEFAULT_START_TIME) as Date | number | string,
+					);
+					await runLive({
+						initialStartTime,
+						intervalMs,
+						signal: liveSignal,
+						now: opts.now,
+						sleep: opts.sleep,
+						tick: async (windowStart, windowEnd) => {
+							const tickOptions: FakeTimeSeriesOptions = {
+								...parsedOptions,
+								startTime: windowStart,
+								endTime: windowEnd,
+							};
+							const result = await generateRunner(tickOptions);
+							log(JSON.stringify(result, null, 2));
+						},
+					});
+					return;
+				}
 
 				const result = await generateRunner(parsedOptions);
 				log(JSON.stringify(result, null, 2));
@@ -177,6 +274,11 @@ export function buildProgram(opts: BuildProgramOptions = {}): Command {
 				const cliHeadersRaw = cliOptions.headers as string | undefined;
 				delete cliOptions.sinkUrl;
 				delete cliOptions.headers;
+				// `--live` / `--live-interval` are CLI-only (same reasoning
+				// as the generate command above).
+				const liveMode = cliOptions.live === true;
+				delete cliOptions.live;
+				delete cliOptions.liveInterval;
 
 				const sinkUrl = cliSinkUrl ?? configOptions.sinkUrl;
 				if (!sinkUrl) {
@@ -224,6 +326,36 @@ export function buildProgram(opts: BuildProgramOptions = {}): Command {
 					onError: configOptions.onError ?? sinkBatchErrorHandler,
 				};
 
+				if (liveMode) {
+					const intervalMs = command.getOptionValue("liveInterval") as number;
+					// Resolve startTime exactly once (see the generate action
+					// handler for the full rationale — relative strings must
+					// not drift across ticks).
+					const initialStartTime = parseTime(
+						(parsedOptions.startTime ??
+							configOptions.startTime ??
+							DEFAULT_START_TIME) as Date | number | string,
+					);
+					log("Sending data to sink in live mode...");
+					await runLive({
+						initialStartTime,
+						intervalMs,
+						signal: liveSignal,
+						now: opts.now,
+						sleep: opts.sleep,
+						tick: async (windowStart, windowEnd) => {
+							const tickOptions: FakeTimeSeriesToSinkOptions = {
+								...parsedOptions,
+								startTime: windowStart,
+								endTime: windowEnd,
+							};
+							const result = await toSinkRunner(tickOptions);
+							log(JSON.stringify(result, null, 2));
+						},
+					});
+					return;
+				}
+
 				log("Sending data to sink...");
 				const result = await toSinkRunner(parsedOptions);
 				log(JSON.stringify(result, null, 2));
@@ -256,8 +388,26 @@ const isDirectInvocation = (): boolean => {
 };
 
 if (isDirectInvocation()) {
-	const program = buildProgram();
-	program.parseAsync(process.argv).catch((error) => {
-		defaultErrorHandler(error);
-	});
+	// Wire SIGINT / SIGTERM to abort the live-mode tick loop so a Ctrl-C
+	// exits cleanly instead of interrupting a tick mid-flight and leaving
+	// a half-sent HTTP batch. We attach the listeners here (not inside
+	// buildProgram) so the signal plumbing stays scoped to the actual
+	// process and never pollutes tests or embedded consumers.
+	const liveController = new AbortController();
+	const onShutdownSignal = (): void => {
+		liveController.abort();
+	};
+	process.on("SIGINT", onShutdownSignal);
+	process.on("SIGTERM", onShutdownSignal);
+
+	const program = buildProgram({ liveSignal: liveController.signal });
+	program
+		.parseAsync(process.argv)
+		.catch((error) => {
+			defaultErrorHandler(error);
+		})
+		.finally(() => {
+			process.removeListener("SIGINT", onShutdownSignal);
+			process.removeListener("SIGTERM", onShutdownSignal);
+		});
 }
