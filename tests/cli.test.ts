@@ -287,6 +287,18 @@ describe("parseDurationMs", () => {
 		// of bug parsePositiveInt guards against with its regex gate.
 		expect(() => parse("1s foo")).toThrow(/--live-interval/);
 	});
+
+	it("rejects interior whitespace even when ms() would accept it", () => {
+		// `ms("1 s")` returns 1000 — the library happily accepts an
+		// interior space between the number and the unit. We intentionally
+		// reject this at the CLI boundary because:
+		//   1. Users writing duration flags should use the canonical form
+		//      ("1s", not "1 s"); permitting both is needless variation.
+		//   2. Accepting interior whitespace widens the attack surface for
+		//      partial-parse bugs if a future `ms` release starts
+		//      accepting "1 s foo".
+		expect(() => parse("1 s")).toThrow(/--live-interval/);
+	});
 });
 
 describe("runLive", () => {
@@ -883,6 +895,59 @@ describe("buildProgram", () => {
 					{ from: "node" },
 				),
 			).rejects.toThrow(/--live-interval/);
+		});
+
+		it("does not invoke the runner when liveSignal is already aborted on entry", async () => {
+			// Guards the "abort before parseAsync starts" path — e.g. a user
+			// Ctrl-C that fires between `buildProgram` and `parseAsync`.
+			// The CLI must observe the pre-aborted signal and exit the live
+			// loop without firing a single tick, not hang or double-tick.
+			const controller = new AbortController();
+			controller.abort();
+			const generateCalls: FakeTimeSeriesOptions[] = [];
+			const logs: string[] = [];
+
+			const program = buildProgram({
+				generateRunner: async (options) => {
+					generateCalls.push(options);
+					return {
+						batches: [],
+						startTime: options.startTime as Date,
+						endTime: options.endTime as Date,
+						minInterval: 1000,
+						maxInterval: 1000,
+						totalBatches: 0,
+						totalMessages: 0,
+					};
+				},
+				log: (msg) => logs.push(msg),
+				onError: (err) => {
+					throw err;
+				},
+				liveSignal: controller.signal,
+				now: () => new Date("2024-01-01T00:00:05Z"),
+				sleep: async () => undefined,
+			});
+			program.exitOverride();
+			for (const cmd of program.commands) {
+				cmd.exitOverride();
+			}
+
+			await program.parseAsync(
+				[
+					"node",
+					"cli",
+					"generate",
+					"--startTime",
+					"2024-01-01T00:00:00Z",
+					"--live",
+				],
+				{ from: "node" },
+			);
+
+			// Pre-aborted signal → zero ticks → zero logs.
+			expect(generateCalls).toHaveLength(0);
+			expect(logs).toHaveLength(0);
 		});
 
 		it("defaults --live-interval to 1s when the flag is omitted", async () => {

@@ -182,6 +182,12 @@ export const parseDurationMs =
 	(value: string): number => {
 		const trimmed = value.trim();
 
+		const invalid = (): Error =>
+			new Error(
+				`${name} must be a non-negative duration ` +
+					`(e.g. "1s", "500ms", or a millisecond integer; got "${value}")`,
+			);
+
 		// Fast path: plain non-negative integer → milliseconds.
 		if (NON_NEGATIVE_INT_PATTERN.test(trimmed)) {
 			const parsed = Number.parseInt(trimmed, 10);
@@ -190,26 +196,27 @@ export const parseDurationMs =
 			}
 		}
 
+		// Reject any interior whitespace BEFORE delegating to `ms()`.
+		// Two reasons:
+		//   1. `ms("1 s")` returns 1000 — the library silently accepts a
+		//      space between the number and the unit. Users of this CLI
+		//      should always write the canonical form ("1s" / "500ms"),
+		//      so we draw a firm boundary here.
+		//   2. Rejecting interior whitespace defangs any future `ms`
+		//      release that might start accepting "1 s foo" as 1000 ms
+		//      with a partial parse. Gating on whitespace first makes
+		//      the intent obvious instead of hiding a post-parse check
+		//      that could look like dead code to a later reader.
+		if (/\s/.test(trimmed)) {
+			throw invalid();
+		}
+
 		// Fall back to `ms()` for human-readable durations. `ms()` returns
 		// `undefined` for garbage and accepts negative values (e.g. "-1s"
 		// → -1000), which we must reject.
 		const parsed = msParseDuration(trimmed);
 		if (parsed === undefined || !Number.isFinite(parsed) || parsed < 0) {
-			throw new Error(
-				`${name} must be a non-negative duration ` +
-					`(e.g. "1s", "500ms", or a millisecond integer; got "${value}")`,
-			);
-		}
-
-		// Defence in depth against `ms()` partial parsing. At the time of
-		// writing, `ms("1s foo")` returns `undefined`, but a future version
-		// bump could silently swap behavior. We double-check by re-parsing
-		// the original input minus known-good characters.
-		if (/\s/.test(trimmed)) {
-			throw new Error(
-				`${name} must be a non-negative duration ` +
-					`(e.g. "1s", "500ms", or a millisecond integer; got "${value}")`,
-			);
+			throw invalid();
 		}
 
 		return parsed;
@@ -265,7 +272,17 @@ const defaultLiveSleep = async (
 	} catch (error: unknown) {
 		// AbortError is the expected path during graceful shutdown. Any
 		// other error is a real bug and must surface.
-		if (error instanceof Error && error.name === "AbortError") {
+		//
+		// Node's `timers/promises#setTimeout` throws a `DOMException`
+		// on abort (not an `Error` subclass in every environment), so
+		// we match on `.name` rather than `instanceof Error`. The
+		// `"AbortError"` name is stable across both the `Error` and
+		// `DOMException` paths per the WHATWG abort spec.
+		if (
+			typeof error === "object" &&
+			error !== null &&
+			(error as { name?: unknown }).name === "AbortError"
+		) {
 			return;
 		}
 		throw error;

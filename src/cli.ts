@@ -39,6 +39,28 @@ const DEFAULT_LIVE_INTERVAL_MS = 1000;
 const DEFAULT_START_TIME = "-1 day";
 
 /**
+ * Read the `--live-interval` value off a commander `Command` and
+ * validate it at the CLI boundary. `getOptionValue` is typed
+ * `unknown` because commander can store arbitrary values there, so
+ * this helper narrows it to `number` with a runtime check — a
+ * non-number at this point indicates a wiring bug
+ * (e.g. `parseDurationMs` was unhooked from the option, or a future
+ * commander upgrade changed its coercion path) and we surface a
+ * clear error instead of letting an `as number` cast paper over it.
+ */
+const readLiveIntervalMs = (command: Command): number => {
+	const raw = command.getOptionValue("liveInterval");
+	if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) {
+		throw new Error(
+			`Internal error: --live-interval must resolve to a non-negative finite number (got ${String(
+				raw,
+			)})`,
+		);
+	}
+	return raw;
+};
+
+/**
  * Options accepted by {@link buildProgram} — lets tests inject stubs for
  * the library runners and override the error handler so commander doesn't
  * call `process.exit` under test.
@@ -206,20 +228,20 @@ export function buildProgram(opts: BuildProgramOptions = {}): Command {
 				};
 
 				if (liveMode) {
-					// `getOptionValue` returns the committed value whether it
-					// came from the CLI, the default, or an intermediate
-					// option-source, so we get the default 1000ms fallback
-					// for free when the user omits the flag.
-					const intervalMs = command.getOptionValue("liveInterval") as number;
+					const intervalMs = readLiveIntervalMs(command);
 					// CRITICAL: resolve `startTime` exactly ONCE up front.
 					// A relative string like "-1 day" must NOT be re-parsed
 					// every tick — that would anchor every window to
 					// "1 day ago (relative to current now)" and trap live
 					// mode in the same window forever.
+					//
+					// `parsedOptions` already spreads `configOptions`, so we
+					// only need the CLI/config-merged value plus a library
+					// default — no separate `configOptions.startTime` arm.
+					// The `??` chain narrows `undefined` away so parseTime
+					// gets a concrete input without any type-widening cast.
 					const initialStartTime = parseTime(
-						(parsedOptions.startTime ??
-							configOptions.startTime ??
-							DEFAULT_START_TIME) as Date | number | string,
+						parsedOptions.startTime ?? DEFAULT_START_TIME,
 					);
 					await runLive({
 						initialStartTime,
@@ -327,14 +349,12 @@ export function buildProgram(opts: BuildProgramOptions = {}): Command {
 				};
 
 				if (liveMode) {
-					const intervalMs = command.getOptionValue("liveInterval") as number;
+					const intervalMs = readLiveIntervalMs(command);
 					// Resolve startTime exactly once (see the generate action
 					// handler for the full rationale — relative strings must
 					// not drift across ticks).
 					const initialStartTime = parseTime(
-						(parsedOptions.startTime ??
-							configOptions.startTime ??
-							DEFAULT_START_TIME) as Date | number | string,
+						parsedOptions.startTime ?? DEFAULT_START_TIME,
 					);
 					log("Sending data to sink in live mode...");
 					await runLive({
@@ -397,17 +417,27 @@ if (isDirectInvocation()) {
 	const onShutdownSignal = (): void => {
 		liveController.abort();
 	};
+	const removeShutdownListeners = (): void => {
+		process.removeListener("SIGINT", onShutdownSignal);
+		process.removeListener("SIGTERM", onShutdownSignal);
+	};
 	process.on("SIGINT", onShutdownSignal);
 	process.on("SIGTERM", onShutdownSignal);
 
-	const program = buildProgram({ liveSignal: liveController.signal });
-	program
-		.parseAsync(process.argv)
-		.catch((error) => {
-			defaultErrorHandler(error);
-		})
-		.finally(() => {
-			process.removeListener("SIGINT", onShutdownSignal);
-			process.removeListener("SIGTERM", onShutdownSignal);
-		});
+	// Use try/catch to cover the (theoretical) path where `buildProgram`
+	// or synchronous setup inside `parseAsync` throws before returning
+	// the Promise — relying solely on `.finally()` would leak the signal
+	// listeners for the lifetime of the process in that case.
+	try {
+		const program = buildProgram({ liveSignal: liveController.signal });
+		program
+			.parseAsync(process.argv)
+			.catch((error) => {
+				defaultErrorHandler(error);
+			})
+			.finally(removeShutdownListeners);
+	} catch (error) {
+		removeShutdownListeners();
+		defaultErrorHandler(error);
+	}
 }
