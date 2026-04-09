@@ -1,40 +1,30 @@
 {
-	"$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
+	"$schema": "https://biomejs.dev/schemas/2.4.10/schema.json",
 	"files": {
-		"ignore": [
-			"**/dist/**",
-			"**/storybook-static/**",
-			"**/coverage/**",
-			"**/.next/**",
-			"**/node_modules/**"
+		"includes": [
+			"**",
+			"!**/dist",
+			"!**/storybook-static",
+			"!**/coverage",
+			"!**/.next",
+			"!**/node_modules"
 		]
 	},
-	"organizeImports": {
-		"enabled": true
-	},
-	"css": {
-		"formatter": {
-			"enabled": true
-		},
-		"linter": {
-			"enabled": true
+	"assist": {
+		"enabled": true,
+		"actions": {
+			"source": {
+				"organizeImports": "on"
+			}
 		}
 	},
-
+	"formatter": {
+		"enabled": true
+	},
 	"linter": {
 		"enabled": true,
 		"rules": {
-			"nursery": {
-				"useSortedClasses": {
-					"fix": "safe",
-					"level": "error",
-					"options": {
-						"attributes": ["classList"],
-						"functions": ["clsx", "cm", "cva", "tw"]
-					}
-				}
-			},
-			"all": true,
+			"recommended": true,
 			"style": {
 				"noDefaultExport": "off",
 				"useFilenamingConvention": "off",
@@ -45,19 +35,11 @@
 					}
 				}
 			},
-			"performance": {
-				"noReExportAll": "off",
-				"noBarrelFile": "off"
-			},
 			"suspicious": {
 				"noReactSpecificProps": "off",
 				"noConsole": {
-					"fix": "none",
-					"level": "warn"
-				},
-				"noConsoleLog": {
-					"fix": "none",
-					"level": "warn"
+					"level": "warn",
+					"fix": "none"
 				}
 			},
 			"correctness": {
@@ -67,8 +49,5 @@
 				"noNodejsModules": "off"
 			}
 		}
-	},
-	"formatter": {
-		"enabled": true
 	}
 }
