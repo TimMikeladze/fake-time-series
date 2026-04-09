@@ -188,6 +188,15 @@ export const parseDurationMs =
 					`(e.g. "1s", "500ms", or a millisecond integer; got "${value}")`,
 			);
 
+		// Empty / whitespace-only input: guard BEFORE touching `ms()`.
+		// `ms("")` throws a raw library error ("val is not a non-empty
+		// string or a valid number") which would otherwise leak through
+		// and override our friendly error message. Whitespace-only
+		// inputs collapse to "" after `trim()` and hit the same path.
+		if (trimmed.length === 0) {
+			throw invalid();
+		}
+
 		// Fast path: plain non-negative integer → milliseconds.
 		if (NON_NEGATIVE_INT_PATTERN.test(trimmed)) {
 			const parsed = Number.parseInt(trimmed, 10);
@@ -221,6 +230,31 @@ export const parseDurationMs =
 
 		return parsed;
 	};
+
+/**
+ * Read the `--live-interval` value off a commander `Command` and
+ * validate it at the CLI boundary. `getOptionValue` is typed `unknown`
+ * because commander can store arbitrary values there, so this helper
+ * narrows it to `number` with a runtime check — a non-number at this
+ * point indicates a wiring bug (e.g. `parseDurationMs` was unhooked
+ * from the option, or a future commander upgrade changed its coercion
+ * path) and we surface a clear error instead of letting an `as number`
+ * cast paper over it.
+ *
+ * Exported so the wiring-bug guard is independently testable without
+ * setting up a full commander pipeline.
+ */
+export const readLiveIntervalMs = (command: Command): number => {
+	const raw = command.getOptionValue("liveInterval");
+	if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) {
+		throw new Error(
+			`Internal error: --live-interval must resolve to a non-negative finite number (got ${String(
+				raw,
+			)})`,
+		);
+	}
+	return raw;
+};
 
 /**
  * Options accepted by {@link runLive}.

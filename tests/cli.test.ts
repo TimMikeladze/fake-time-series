@@ -8,6 +8,7 @@ import {
 	parseDurationMs,
 	parsePositiveInt,
 	parseProbability,
+	readLiveIntervalMs,
 	readVersion,
 	resolveConfigPath,
 	runLive,
@@ -299,6 +300,67 @@ describe("parseDurationMs", () => {
 		//      accepting "1 s foo".
 		expect(() => parse("1 s")).toThrow(/--live-interval/);
 	});
+
+	it("rejects an empty string with the caller's friendly error", () => {
+		// `ms("")` throws a NATIVE error ("val is not a non-empty string
+		// or a valid number"), not returns undefined — so without an
+		// explicit early guard, the user would see the ms library's
+		// internal message leaking through instead of the friendly
+		// `--live-interval must be a non-negative duration...` message.
+		expect(() => parse("")).toThrow(/--live-interval/);
+	});
+
+	it("rejects whitespace-only input (collapses to empty after trim)", () => {
+		// After `.trim()` both "   " and "\t" become "", which would
+		// otherwise fall through to the same `ms("")` throw path.
+		expect(() => parse("   ")).toThrow(/--live-interval/);
+		expect(() => parse("\t")).toThrow(/--live-interval/);
+	});
+});
+
+describe("readLiveIntervalMs", () => {
+	// Minimal command-shaped stub: only `getOptionValue` is consulted.
+	const fakeCommand = (
+		value: unknown,
+	): Parameters<typeof readLiveIntervalMs>[0] =>
+		({
+			getOptionValue: (_name: string) => value,
+		}) as unknown as Parameters<typeof readLiveIntervalMs>[0];
+
+	it("returns the number as-is when it is a finite non-negative number", () => {
+		expect(readLiveIntervalMs(fakeCommand(1000))).toBe(1000);
+		expect(readLiveIntervalMs(fakeCommand(0))).toBe(0);
+		expect(readLiveIntervalMs(fakeCommand(0.5))).toBe(0.5);
+	});
+
+	it("throws an internal-error message on a non-number (wiring bug guard)", () => {
+		// This path only fires if commander's parser wiring is broken —
+		// e.g. a future refactor detaches parseDurationMs from the option.
+		// The message must clearly say "Internal error" so the reader
+		// understands it's NOT a user-facing validation failure.
+		expect(() => readLiveIntervalMs(fakeCommand("1000"))).toThrow(
+			/Internal error/,
+		);
+		expect(() => readLiveIntervalMs(fakeCommand(undefined))).toThrow(
+			/Internal error/,
+		);
+		expect(() => readLiveIntervalMs(fakeCommand(null))).toThrow(
+			/Internal error/,
+		);
+	});
+
+	it("throws on a negative number", () => {
+		expect(() => readLiveIntervalMs(fakeCommand(-1))).toThrow(/Internal error/);
+	});
+
+	it("throws on NaN or Infinity", () => {
+		expect(() => readLiveIntervalMs(fakeCommand(Number.NaN))).toThrow(
+			/Internal error/,
+		);
+		expect(() =>
+			readLiveIntervalMs(fakeCommand(Number.POSITIVE_INFINITY)),
+		).toThrow(/Internal error/);
+	});
 });
 
 describe("runLive", () => {
@@ -461,6 +523,48 @@ describe("runLive", () => {
 		for (const s of sleeps) {
 			expect(s).toBe(250);
 		}
+	});
+
+	it("uses the real default sleep and wakes cleanly when the signal fires mid-sleep", async () => {
+		// Every other runLive test injects a no-op `sleep`, so the real
+		// `timers/promises#setTimeout` path — the only path that exercises
+		// the DOMException-safe AbortError swallow in `defaultLiveSleep` —
+		// was untested before this case. We use a deliberately LONG sleep
+		// (10 seconds) and then abort from the outside after 50ms; if
+		// the AbortError weren't swallowed the promise would reject, and
+		// if the abort weren't wired into the timer we'd wait out the
+		// full 10 seconds. Either failure mode would blow this test up.
+		const controller = new AbortController();
+		let ticks = 0;
+		const startedAt = Date.now();
+
+		// Initial window is 1 second behind "now" so the first tick
+		// fires immediately, then the loop enters the real sleep.
+		const runPromise = runLive({
+			initialStartTime: new Date(startedAt - 1000),
+			intervalMs: 10_000,
+			signal: controller.signal,
+			// No `sleep` override on purpose — exercises defaultLiveSleep.
+			tick: async () => {
+				ticks++;
+			},
+		});
+
+		// Give the loop a moment to complete the first tick and enter
+		// the real sleep, then abort.
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		controller.abort();
+
+		// Must resolve cleanly (NOT reject with AbortError). If the
+		// swallow path is broken this `await` rejects and the test fails.
+		await runPromise;
+
+		const elapsed = Date.now() - startedAt;
+		expect(ticks).toBe(1);
+		// We waited 50ms + a tiny bit of teardown — nowhere near the
+		// configured 10s interval, which proves the abort actually
+		// interrupted the sleep instead of letting it run to completion.
+		expect(elapsed).toBeLessThan(2_000);
 	});
 
 	it("does not sleep after a tick if the signal was aborted during that tick", async () => {
@@ -865,6 +969,60 @@ describe("buildProgram", () => {
 			}
 		});
 
+		it("rejects --endTime + --live with a clear incompatibility message", async () => {
+			// Without this guard, a user who writes
+			// `generate --endTime 2026-01-01 --live` would silently have
+			// their endTime overwritten by `windowEnd = now()` on every
+			// tick — a data-loss-adjacent footgun (the user thinks they
+			// asked for bounded streaming, but the loop streams
+			// indefinitely). The error keeps the two flags in opposing
+			// corners so the mistake is surfaced loudly at parse time.
+			const controller = new AbortController();
+			const generateCalls: FakeTimeSeriesOptions[] = [];
+			const program = buildProgram({
+				generateRunner: async (options) => {
+					generateCalls.push(options);
+					return {
+						batches: [],
+						startTime: options.startTime as Date,
+						endTime: options.endTime as Date,
+						minInterval: 1000,
+						maxInterval: 1000,
+						totalBatches: 0,
+						totalMessages: 0,
+					};
+				},
+				log: () => undefined,
+				onError: (err) => {
+					throw err;
+				},
+				liveSignal: controller.signal,
+			});
+			program.exitOverride();
+			for (const cmd of program.commands) {
+				cmd.exitOverride();
+			}
+
+			await expect(
+				program.parseAsync(
+					[
+						"node",
+						"cli",
+						"generate",
+						"--startTime",
+						"2024-01-01T00:00:00Z",
+						"--endTime",
+						"2026-01-01T00:00:00Z",
+						"--live",
+					],
+					{ from: "node" },
+				),
+			).rejects.toThrow(/--endTime.*--live|--live.*--endTime/);
+			// Runner must not have been invoked — we fail before entering
+			// the tick loop.
+			expect(generateCalls).toHaveLength(0);
+		});
+
 		it("rejects an invalid --live-interval at parse time", async () => {
 			const controller = new AbortController();
 			const program = buildProgram({
@@ -1191,6 +1349,55 @@ describe("buildProgram", () => {
 			expect(call.concurrency).toBe(11);
 			// Config wins where no CLI flag: maxBatchSize 7 from fixture
 			expect(call.maxBatchSize).toBe(7);
+		});
+
+		it("rejects --endTime + --live with a clear incompatibility message", async () => {
+			// Same guard as the `generate --live` case: the send command
+			// must also reject the combination so a user doesn't think
+			// they're sending bounded data while the loop streams
+			// indefinitely.
+			const controller = new AbortController();
+			const toSinkCalls: FakeTimeSeriesToSinkOptions[] = [];
+			const program = buildProgram({
+				toSinkRunner: async (options) => {
+					toSinkCalls.push(options);
+					return {
+						batches: [],
+						startTime: options.startTime as Date,
+						endTime: options.endTime as Date,
+						minInterval: 1000,
+						maxInterval: 1000,
+						totalBatches: 0,
+						totalMessages: 0,
+					};
+				},
+				log: () => undefined,
+				onError: (err) => {
+					throw err;
+				},
+				liveSignal: controller.signal,
+			});
+			program.exitOverride();
+			for (const cmd of program.commands) {
+				cmd.exitOverride();
+			}
+
+			await expect(
+				program.parseAsync(
+					[
+						"node",
+						"cli",
+						"send",
+						"--sink-url",
+						"https://example.com",
+						"--endTime",
+						"2026-01-01T00:00:00Z",
+						"--live",
+					],
+					{ from: "node" },
+				),
+			).rejects.toThrow(/--endTime.*--live|--live.*--endTime/);
+			expect(toSinkCalls).toHaveLength(0);
 		});
 
 		it("loops in live mode, chaining windows, until the signal aborts", async () => {

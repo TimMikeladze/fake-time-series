@@ -8,6 +8,7 @@ import {
 	parseDurationMs,
 	parsePositiveInt,
 	parseProbability,
+	readLiveIntervalMs,
 	readVersion,
 	runLive,
 } from "./cli-helpers";
@@ -39,25 +40,24 @@ const DEFAULT_LIVE_INTERVAL_MS = 1000;
 const DEFAULT_START_TIME = "-1 day";
 
 /**
- * Read the `--live-interval` value off a commander `Command` and
- * validate it at the CLI boundary. `getOptionValue` is typed
- * `unknown` because commander can store arbitrary values there, so
- * this helper narrows it to `number` with a runtime check — a
- * non-number at this point indicates a wiring bug
- * (e.g. `parseDurationMs` was unhooked from the option, or a future
- * commander upgrade changed its coercion path) and we surface a
- * clear error instead of letting an `as number` cast paper over it.
+ * Reject `--endTime X --live` at action-handler entry. Without this
+ * guard, the user's `endTime` would be silently overwritten by
+ * `windowEnd = now()` on every tick — a footgun where the user thinks
+ * they asked for bounded streaming but gets an unbounded loop instead.
+ *
+ * Only the CLI-explicit case triggers: a config file that happens to
+ * set `endTime` does NOT trip this guard, because configs are often
+ * shared across use cases and silently overriding a config value in
+ * live mode is the lesser evil compared to refusing to run at all.
  */
-const readLiveIntervalMs = (command: Command): number => {
-	const raw = command.getOptionValue("liveInterval");
-	if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) {
+const assertLiveEndTimeCompat = (cliOptions: Record<string, unknown>): void => {
+	if (cliOptions.endTime !== undefined) {
 		throw new Error(
-			`Internal error: --live-interval must resolve to a non-negative finite number (got ${String(
-				raw,
-			)})`,
+			"--endTime is incompatible with --live mode " +
+				"(live mode streams indefinitely until SIGINT/SIGTERM). " +
+				"Remove one of the flags.",
 		);
 	}
-	return raw;
 };
 
 /**
@@ -218,6 +218,12 @@ export function buildProgram(opts: BuildProgramOptions = {}): Command {
 				// in `FakeTimeSeriesOptions` and potentially confuse future
 				// config consumers.
 				const liveMode = cliOptions.live === true;
+				if (liveMode) {
+					// Must run BEFORE we delete `endTime` (we don't — but
+					// also before live/liveInterval are deleted, purely for
+					// readability: all live-mode validation lives here).
+					assertLiveEndTimeCompat(cliOptions);
+				}
 				delete cliOptions.live;
 				delete cliOptions.liveInterval;
 
@@ -299,6 +305,9 @@ export function buildProgram(opts: BuildProgramOptions = {}): Command {
 				// `--live` / `--live-interval` are CLI-only (same reasoning
 				// as the generate command above).
 				const liveMode = cliOptions.live === true;
+				if (liveMode) {
+					assertLiveEndTimeCompat(cliOptions);
+				}
 				delete cliOptions.live;
 				delete cliOptions.liveInterval;
 
@@ -428,11 +437,20 @@ if (isDirectInvocation()) {
 	// or synchronous setup inside `parseAsync` throws before returning
 	// the Promise — relying solely on `.finally()` would leak the signal
 	// listeners for the lifetime of the process in that case.
+	//
+	// CRITICAL: `defaultErrorHandler` calls `process.exit(1)` synchronously,
+	// which drops any pending microtasks — including this chain's own
+	// `.finally`. So the `.catch` callback MUST remove the listeners
+	// before invoking the error handler, otherwise the cleanup never
+	// runs on the failure path. On the success path `.finally` still
+	// handles cleanup, and `removeListener` is idempotent so doubling up
+	// in edge cases is harmless.
 	try {
 		const program = buildProgram({ liveSignal: liveController.signal });
 		program
 			.parseAsync(process.argv)
 			.catch((error) => {
+				removeShutdownListeners();
 				defaultErrorHandler(error);
 			})
 			.finally(removeShutdownListeners);
