@@ -8,6 +8,7 @@ A flexible CLI tool and library for generating fake time series data. Perfect fo
 - ✅ Fine-grained control over data generation with batch size and interval settings
 - ✅ Built-in randomization features for more realistic data patterns.
 - ✅ Simple configuration via JavaScript/ESM config files.
+- ✅ `--live` mode to continuously stream data until interrupted — great for load testing and local demos.
 
 ## 📡 Installation
 
@@ -186,6 +187,36 @@ For `minInterval` and `maxInterval`:
 | `sinkUrl` | Endpoint URL (send only) | required |
 | `headers` | Request headers (send only) | `{"Content-Type": "application/json"}` |
 | `retainBatches` | Keep generated batches in the result (send only; set `false` for large datasets) | `true` |
+| `--live` | Continuously stream data in a loop until SIGINT/SIGTERM (CLI only) | `false` |
+| `--live-interval` | Interval between ticks in `--live` mode (e.g. `1s`, `500ms`, or raw ms) | `1s` |
+
+## ⚡ Live Mode
+
+Pass `--live` to `generate` or `send` to keep the process alive and produce a fresh batch of data on every tick. Each tick covers the window `[previousTickEnd, now]`, so there are no gaps between windows and no duplicated timestamps. The process exits cleanly on `SIGINT` (Ctrl-C) or `SIGTERM`.
+
+Stream to stdout as NDJSON-friendly JSON, one result per tick:
+
+```bash
+fake-time-series generate --live --live-interval 1s --minInterval 100ms --maxInterval 500ms
+```
+
+Stream continuously to an HTTP sink (useful for local demos or load testing an ingest endpoint):
+
+```bash
+fake-time-series send \
+  --live \
+  --live-interval 500ms \
+  --sink-url "http://localhost:3000/api/ingest" \
+  --minInterval 50ms \
+  --maxInterval 200ms
+```
+
+**Notes:**
+
+- Your `startTime` is resolved **exactly once** before the loop starts, so relative strings like `--startTime "-1 day"` anchor the first window to "one day before process start" and then advance naturally — they don't re-resolve to a moving "now - 1 day" on every tick.
+- `--endTime` is **incompatible** with `--live`: the CLI will error out immediately if you pass both, since live mode streams indefinitely until interrupted. Use one or the other.
+- When you Ctrl-C during `send --live`, the loop stops accepting new ticks immediately but waits for any in-flight HTTP requests to finish before exiting, so you don't truncate partially-sent batches.
+- `--live-interval` accepts the same duration formats as the other interval flags — `1s`, `500ms`, `2m`, or a plain millisecond integer like `250`.
 
 ## Examples
 
@@ -204,4 +235,12 @@ Send data with custom headers:
 fake-time-series send \
   --sink-url "http://localhost:3000/api/ingest" \
   --headers '{"Authorization": "Bearer token123"}'
+```
+
+Continuously stream data to a local ingest endpoint until you press Ctrl-C:
+```bash
+fake-time-series send \
+  --live \
+  --live-interval 1s \
+  --sink-url "http://localhost:3000/api/ingest"
 ```
