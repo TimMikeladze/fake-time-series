@@ -72,7 +72,7 @@ For example, the following shape function generates a random temperature value b
 
 ```javascript
 // fake-time-series.config.mjs
-export const config = {
+export const options = {
 	shapes: {
 		temperature: (timestamp) => ({
 			sensorId: Math.random().toString(36).substring(2, 15),
@@ -129,10 +129,10 @@ This will transform each data point from:
 }
 ```
 
-To:
+To (note `partitionKey` reflects `dataPoint.key`, i.e. the shape name):
 ```javascript
 {
-  partitionKey: "138lnj9gs7kq",
+  partitionKey: "temperature",
   timestamp: 1753950933982,
   data: {
     value: 12.1311483084942,
@@ -165,7 +165,7 @@ For `minInterval` and `maxInterval`:
 - Minutes: `1m`, `5m`
 - Hours: `1h`, `12h`
 - Days: `1d`
-- Milliseconds: `1234567890`
+- Raw milliseconds as a number: e.g. `1000` (1 second), `60000` (1 minute)
 
 ## 🔧 Options
 
@@ -185,6 +185,7 @@ For `minInterval` and `maxInterval`:
 | `concurrency` | Max concurrent requests (send only) | `10` |
 | `sinkUrl` | Endpoint URL (send only) | required |
 | `headers` | Request headers (send only) | `{"Content-Type": "application/json"}` |
+| `retainBatches` | Keep generated batches in the result (send only; set `false` for large datasets) | `true` |
 
 ## Examples
 
