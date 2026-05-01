@@ -82,7 +82,7 @@
 		"@vitest/coverage-v8": "4.1.4",
 		"concurrently": "9.2.1",
 		"lefthook": "2.1.5",
-		"release-it": "19.2.4",
+		"release-it": "20.0.1",
 		"tsup": "8.5.1",
 		"tsx": "4.21.0",
 		"typescript": "6.0.2",
